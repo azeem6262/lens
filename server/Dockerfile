@@ -1,17 +1,19 @@
-# Use a Python image that supports Playwright
+# Use the official Playwright image
 FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
+# Set workdir
 WORKDIR /app
 
-# Copy requirements and install
+# Install dependencies first (better caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers (Industry Tip: Only install Chromium to save space)
+# ONLY install Chromium (saves 500MB+ vs installing all browsers)
 RUN python -m playwright install chromium
 
-# Copy the rest of your app
+# Copy your code
 COPY . .
 
-# Start the FastAPI server
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# IMPORTANT: We use 'python -m uvicorn' to ensure the pathing is correct
+# We also set --workers 1 to stay within Free Tier RAM limits
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000", "--workers", "1"]
