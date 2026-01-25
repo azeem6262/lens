@@ -8,7 +8,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Playwright browsers (Industry Tip: Only install Chromium to save space)
-RUN playwright install chromium
+RUN python -m playwright install chromium
 
 # Copy the rest of your app
 COPY . .
