@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+cloudscraper
+beautifulsoup4
+pandas
+xgboost
+scikit-learn
