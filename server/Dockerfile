@@ -16,4 +16,5 @@ COPY . .
 
 # IMPORTANT: We use 'python -m uvicorn' to ensure the pathing is correct
 # We also set --workers 1 to stay within Free Tier RAM limits
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000", "--workers", "1"]
+# Temporary command to see what files exist in the container
+CMD ["ls", "-R"]
