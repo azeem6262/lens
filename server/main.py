@@ -257,74 +257,59 @@ async def segregate_players():
 
 @app.get("/scrape/fbref/attackers")
 async def scrape_fbref_attackers():
-    # 1. Fetch attackers from Supabase who still need IDs
-    response = supabase.table("players") \
-        .select("tm_id, name, club") \
-        .eq("position_group", "Attacker") \
-        .is_("fbref_id", "null") \
-        .execute()
+    # 1. Fetch attackers who still need an ID
+    response = supabase.table("players").select("tm_id, name, club").eq("position_group", "Attacker").is_("fbref_id", "null").execute()
     attackers = response.data
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         page = await context.new_page()
 
-        for player in attackers[:5]: # Testing small batch
+        for player in attackers[:3]: # Testing very small batch first
             try:
-                # FORCE GOOGLE: site:fbref.com ensures no Transfermarkt lists appear
-                search_query = f"site:fbref.com {player['name']} {player['club']} scouting report"
-                search_url = f"https://www.google.com/search?q={search_query.replace(' ', '+')}"
+                # FORCE FBRef: site:fbref.com prevents Transfermarkt from appearing
+                query = f"site:fbref.com {player['name']} {player['club']} scouting report"
+                search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
                 
                 await page.goto(search_url, wait_until="networkidle", timeout=30000)
                 
-                # TARGET ORGANIC: Ignore snippets and lists by looking inside the #search container
-                # We specifically look for URLs containing '/en/players/'
+                # ORGANIC ONLY: We target the #search results, ignoring the 'Featured Snippets' top box
                 fbref_link = page.locator("#search a[href*='fbref.com/en/players/']").first
                 
                 if await fbref_link.count() > 0:
                     profile_url = await fbref_link.get_attribute("href")
+                    fb_id = profile_url.split('/')[5]
                     
-                    # URL CHECK: Verify it's a profile (e.g., /en/players/afdc14d7/Nico-Williams)
-                    # This prevents landing on a generic 'Top Scorers' or 'Team' page
-                    if "/players/" in profile_url and len(profile_url.split('/')) >= 6:
-                        fb_id = profile_url.split('/')[5]
-                        
-                        # Direct navigation to the 'Standard-Stats' report
-                        scouting_url = f"https://fbref.com/en/players/{fb_id}/scouting/365/Standard-Stats-Scouting-Report"
-                        await page.goto(scouting_url, wait_until="domcontentloaded", timeout=30000)
-                        
-                        # EXTRACTION: Match by row label
-                        async def get_val(label):
-                            loc = page.locator(f"tr:has-text('{label}') td").first
-                            return (await loc.inner_text()).strip() if await loc.count() > 0 else "0.0"
+                    # Direct jump to the deep scouting stats
+                    scouting_url = f"https://fbref.com/en/players/{fb_id}/scouting/365/Standard-Stats-Scouting-Report"
+                    await page.goto(scouting_url, wait_until="domcontentloaded", timeout=30000)
+                    
+                    # Helper for extracting 'Per 90' data
+                    async def get_val(label):
+                        loc = page.locator(f"tr:has-text('{label}') td").first
+                        return (await loc.inner_text()).strip() if await loc.count() > 0 else "0.0"
 
-                        # Extracting your required metrics
-                        raw_stats = {
-                            "goals_per_90": await get_val("Goals"),
-                            "npxg_per_90": await get_val("npxG"),
-                            "shots_total_per_90": await get_val("Shots Total"),
-                            "conversion_rate": await get_val("Goals/Shot"),
-                            "sca_per_90": await get_val("Shot-Creating Actions"),
-                            "progressive_carries_per_90": await get_val("Progressive Carries")
-                        }
+                    stats = {
+                        "goals_per_90": await get_val("Goals"),
+                        "npxg_per_90": await get_val("npxG"),
+                        "shots_total_per_90": await get_val("Shots Total"),
+                        "conversion_rate": await get_val("Goals/Shot"),
+                        "sca_per_90": await get_val("Shot-Creating Actions"),
+                        "progressive_carries_per_90": await get_val("Progressive Carries")
+                    }
 
-                        # CLEAN & SAVE: Convert to floats and push to Supabase
-                        clean_stats = {k: float(v) if v and v != '-' else 0.0 for k, v in raw_stats.items()}
-                        
-                        supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
-                        supabase.table("stats_attackers").update(clean_stats).eq("tm_id", player['tm_id']).execute()
+                    # Clean & Save
+                    clean = {k: float(v) if v and v != '-' else 0.0 for k, v in stats.items()}
+                    supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
+                    supabase.table("stats_attackers").update(clean).eq("tm_id", player['tm_id']).execute()
                 
-                await page.wait_for_timeout(2000) # Respectful delay to avoid bans
-
-            except Exception as e:
-                print(f"Skipping {player['name']}: {str(e)}")
+                await page.wait_for_timeout(3000) # Wait to avoid search bans
+            except Exception:
                 continue
 
         await browser.close()
-        return {"status": "success", "processed": len(attackers[:5])}
+        return {"status": "Batch complete", "message": "Verify results in Supabase"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
