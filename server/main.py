@@ -257,68 +257,61 @@ async def segregate_players():
 
 @app.get("/scrape/fbref/attackers")
 async def scrape_fbref_attackers():
-    # 1. Fetch attackers who need FBRef IDs or stats
+    # 1. Fetch attackers who still need an fbref_id
     response = supabase.table("players") \
         .select("tm_id, name, club") \
         .eq("position_group", "Attacker") \
+        .is_("fbref_id", "null") \
         .execute()
     attackers = response.data
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        # Use a very specific User-Agent to avoid the 'Summary' page redirect
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
 
-        for player in attackers[:5]: # Start small to verify
+        for player in attackers[:5]: # Try a small batch first
             try:
-                # Step A: SEARCH SPECIFICALLY FOR FBREF
-                # We add 'site:fbref.com' to the query to force Google to ignore Transfermarkt links
-                query = f"{player['name']} {player['club']} site:fbref.com scouting report"
-                search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+                # Force Google to ONLY show results from fbref.com
+                search_query = f"site:fbref.com {player['name']} {player['club']} scouting report"
+                search_url = f"https://www.google.com/search?q={search_query.replace(' ', '+')}"
                 
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+                await page.goto(search_url, wait_until="networkidle", timeout=30000)
                 
-                # Find the FBRef link specifically
-                link_element = page.locator("a[href*='fbref.com/en/players/']").first
-                if await link_element.count() == 0: continue
+                # NEW SELECTOR: specifically looking for organic results with FBRef in the URL
+                # This avoids the "Snippets" and "People also ask" sections
+                fbref_link_locator = page.locator("a[href*='fbref.com/en/players/']").filter(has_not_text="Search")
                 
-                full_url = await link_element.get_attribute("href")
-                fb_id = full_url.split('/')[5]
+                if await fbref_link_locator.count() > 0:
+                    # Click the first actual profile link found
+                    target_link = fbref_link_locator.first
+                    full_url = await target_link.get_attribute("href")
+                    
+                    # Safety check: Ensure it's a player profile URL
+                    # Format: https://fbref.com/en/players/ID/Name
+                    if "/players/" in full_url:
+                        fb_id = full_url.split('/')[5]
+                        
+                        # Direct jump to the deep scouting stats
+                        scouting_url = f"https://fbref.com/en/players/{fb_id}/scouting/365/Standard-Stats-Scouting-Report"
+                        await page.goto(scouting_url, wait_until="domcontentloaded", timeout=30000)
+                        
+                        # Logic to pull stats... (use your previous tr:has-text logic here)
+                        
+                        # Save the ID so you never have to search for this player again
+                        supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
                 
-                # Step B: Direct Navigation to the Scouting Report
-                # Using '365' ensures we get the last 365 days of data, not just the current season
-                scouting_url = f"https://fbref.com/en/players/{fb_id}/scouting/365/Standard-Stats-Scouting-Report"
-                await page.goto(scouting_url, wait_until="domcontentloaded", timeout=30000)
-                
-                # Step C: Extraction with strict row matching
-                async def get_val(label):
-                    # We look for the 'Per 90' column in the row containing the text
-                    loc = page.locator(f"tr:has-text('{label}') td").first
-                    return (await loc.inner_text()).strip() if await loc.count() > 0 else "0.0"
+                # Small sleep to be respectful and avoid search bans
+                await page.wait_for_timeout(2000)
 
-                raw_stats = {
-                    "goals_per_90": await get_val("Goals"),
-                    "npxg_per_90": await get_val("npxG"),
-                    "shots_total_per_90": await get_val("Shots Total"),
-                    "conversion_rate": await get_val("Goals/Shot"),
-                    "sca_per_90": await get_val("Shot-Creating Actions"),
-                    "progressive_carries_per_90": await get_val("Progressive Carries")
-                }
-
-                # Step D: Data Cleaning and Sync
-                clean_stats = {k: float(v) if v and v != '-' else 0.0 for k, v in raw_stats.items()}
-                
-                supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
-                supabase.table("stats_attackers").update(clean_stats).eq("tm_id", player['tm_id']).execute()
-
-            except Exception:
+            except Exception as e:
+                print(f"Error processing {player['name']}: {e}")
                 continue
 
         await browser.close()
-        return {"status": "success", "message": "Linked and Scraped FBRef for batch"}
+        return {"status": "Batch complete", "processed_count": len(attackers[:5])}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
