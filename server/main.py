@@ -224,6 +224,37 @@ def get_position_group(raw_position: str):
         
     return "Unknown", None
 
+@app.post("/process/segregate")
+async def segregate_players():
+    try:
+        # 1. Fetch all players from the master index
+        response = supabase.table("players").select("tm_id, position").execute()
+        players = response.data
+        
+        counts = {"Attacker": 0, "Midfielder": 0, "Defender": 0, "Goalkeeper": 0, "Unknown": 0}
+
+        for p in players:
+            # Use your existing helper to find the right category and table
+            group, table_name = get_position_group(p['position'])
+            
+            if table_name:
+                # 2. Insert into the specialized table (upsert avoids duplicates)
+                supabase.table(table_name).upsert({
+                    "tm_id": p['tm_id'],
+                    "scraped_at": "now()"
+                }).execute()
+                
+                # 3. Update the master table so we know the group is assigned
+                supabase.table("players").update({"position_group": group}).eq("tm_id", p['tm_id']).execute()
+                
+                counts[group] += 1
+            else:
+                counts["Unknown"] += 1
+                
+        return {"message": "Segregation complete", "stats": counts}
+    except Exception as e:
+        return {"error": str(e)}
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
