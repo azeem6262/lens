@@ -203,6 +203,27 @@ async def get_player(player_id: str, slug: str):
             await browser.close()
             return {"error": str(e)}
 
+def get_position_group(raw_position: str):
+    pos = raw_position.lower()
+    
+    # Attackers: Look for scoring roles
+    if any(x in pos for x in ["striker", "winger", "forward", "centre-forward", "left wing", "right wing"]):
+        return "Attacker", "stats_attackers"
+    
+    # Midfielders: Look for engine room roles
+    if any(x in pos for x in ["midfield", "amc", "dmc", "cm", "mezzala"]):
+        return "Midfielder", "stats_midfielders"
+    
+    # Defenders: Specifically catch all 'back' and 'defender' variants
+    if any(x in pos for x in ["back", "defender", "cb", "lb", "rb", "sweeper"]):
+        return "Defender", "stats_defenders"
+    
+    # Goalkeepers
+    if "goalkeeper" in pos:
+        return "Goalkeeper", "stats_goalkeepers"
+        
+    return "Unknown", None
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
