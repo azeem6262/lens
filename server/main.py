@@ -257,7 +257,7 @@ async def segregate_players():
 
 @app.get("/scrape/fbref/attackers")
 async def scrape_fbref_attackers():
-    # 1. Fetch attackers who still need an fbref_id
+    # 1. Fetch attackers from Supabase who still need IDs
     response = supabase.table("players") \
         .select("tm_id, name, club") \
         .eq("position_group", "Attacker") \
@@ -272,38 +272,36 @@ async def scrape_fbref_attackers():
         )
         page = await context.new_page()
 
-        for player in attackers[:5]:
+        for player in attackers[:5]: # Testing small batch
             try:
-                # 2. FORCE GOOGLE TO ONLY SHOW FBREF RESULTS
-                # Adding 'site:fbref.com' is the most powerful way to avoid Transfermarkt results
-                query = f"site:fbref.com {player['name']} {player['club']} scouting report"
-                search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+                # FORCE GOOGLE: site:fbref.com ensures no Transfermarkt lists appear
+                search_query = f"site:fbref.com {player['name']} {player['club']} scouting report"
+                search_url = f"https://www.google.com/search?q={search_query.replace(' ', '+')}"
                 
                 await page.goto(search_url, wait_until="networkidle", timeout=30000)
                 
-                # 3. SELECT THE CORRECT ORGANIC LINK
-                # We target links that specifically contain '/players/' and are organic (inside 'div#search')
-                # This ignores 'Featured Snippets', 'People also ask', and ads
-                fbref_link_locator = page.locator("#search a[href*='fbref.com/en/players/']").first
+                # TARGET ORGANIC: Ignore snippets and lists by looking inside the #search container
+                # We specifically look for URLs containing '/en/players/'
+                fbref_link = page.locator("#search a[href*='fbref.com/en/players/']").first
                 
-                if await fbref_link_locator.count() > 0:
-                    profile_url = await fbref_link_locator.get_attribute("href")
+                if await fbref_link.count() > 0:
+                    profile_url = await fbref_link.get_attribute("href")
                     
-                    # Safety check: Ensure it's a specific player profile, not a team list
-                    # URL format should be: /en/players/[ID]/[Name]
-                    parts = profile_url.split('/')
-                    if len(parts) >= 6 and "players" in parts:
-                        fb_id = parts[5]
+                    # URL CHECK: Verify it's a profile (e.g., /en/players/afdc14d7/Nico-Williams)
+                    # This prevents landing on a generic 'Top Scorers' or 'Team' page
+                    if "/players/" in profile_url and len(profile_url.split('/')) >= 6:
+                        fb_id = profile_url.split('/')[5]
                         
-                        # Direct navigation to the 'Standard-Stats' scouting report
+                        # Direct navigation to the 'Standard-Stats' report
                         scouting_url = f"https://fbref.com/en/players/{fb_id}/scouting/365/Standard-Stats-Scouting-Report"
                         await page.goto(scouting_url, wait_until="domcontentloaded", timeout=30000)
                         
-                        # 4. EXTRACTION (Using text-based row matching for resilience)
+                        # EXTRACTION: Match by row label
                         async def get_val(label):
                             loc = page.locator(f"tr:has-text('{label}') td").first
                             return (await loc.inner_text()).strip() if await loc.count() > 0 else "0.0"
 
+                        # Extracting your required metrics
                         raw_stats = {
                             "goals_per_90": await get_val("Goals"),
                             "npxg_per_90": await get_val("npxG"),
@@ -313,22 +311,20 @@ async def scrape_fbref_attackers():
                             "progressive_carries_per_90": await get_val("Progressive Carries")
                         }
 
-                        # 5. SYNC TO DATABASE
+                        # CLEAN & SAVE: Convert to floats and push to Supabase
                         clean_stats = {k: float(v) if v and v != '-' else 0.0 for k, v in raw_stats.items()}
                         
-                        # Save ID to master players table
                         supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
-                        # Save performance to specialized table
                         supabase.table("stats_attackers").update(clean_stats).eq("tm_id", player['tm_id']).execute()
                 
-                await page.wait_for_timeout(2000) # Small delay to avoid search blocks
+                await page.wait_for_timeout(2000) # Respectful delay to avoid bans
 
             except Exception as e:
                 print(f"Skipping {player['name']}: {str(e)}")
                 continue
 
         await browser.close()
-        return {"status": "Batch complete", "count": len(attackers[:5])}
+        return {"status": "success", "processed": len(attackers[:5])}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
