@@ -47,54 +47,52 @@ async def health_check():
 async def ingest_league(league_url: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent="Mozilla/5.0...")
-        page = await context.new_page()
-
-        # STEP 1: Get all Club URLs from the League Table
+        page = await browser.new_page()
         await page.goto(league_url, wait_until="domcontentloaded")
-        club_links = await page.locator("td.hauptlink a").all()
-        club_urls = []
-        for link in club_links:
-            href = await link.get_attribute("href")
-            if href and "startseite/verein" in href:
-                # Construct absolute URL
-                club_urls.append(f"https://www.transfermarkt.com{href}")
         
-        # Remove duplicates
+        # 1. Get all Club URLs first (as we did before)
+        club_links = await page.locator("td.hauptlink a").all()
+        club_urls = [f"https://www.transfermarkt.com{await l.get_attribute('href')}" for l in club_links if "verein" in await l.get_attribute('href')]
         club_urls = list(set(club_urls))
+        
         all_players = []
 
-        # STEP 2: Visit each club and grab its players
         for club_url in club_urls:
-            try:
-                await page.goto(club_url, wait_until="domcontentloaded", timeout=15000)
-                # Select only the player profile links in the squad table
-                player_links = await page.locator("div.responsive-table td.hauptlink a").all()
-                
-                for link in player_links:
-                    href = await link.get_attribute("href")
-                    if href and "profil/spieler" in href:
-                        parts = href.split('/')
-                        all_players.append({
-                            "tm_id": parts[4],
-                            "name": (await link.inner_text()).strip(),
-                            "slug": parts[1]
-                        })
-            except Exception:
-                continue # Skip a club if it fails, don't crash the whole ingest
-
-        # STEP 3: Save to Supabase
-        if all_players:
-            # Use chunks of 100 to avoid Supabase timeout on massive lists
-            for i in range(0, len(all_players), 100):
-                chunk = all_players[i:i + 100]
-                supabase.table("players").upsert(chunk).execute()
+            await page.goto(club_url, wait_until="domcontentloaded")
+            # 2. Target the actual table rows in the squad table
+            rows = await page.locator("table.items > tbody > tr").all()
             
-            await browser.close()
-            return {"status": "success", "total_ingested": len(all_players)}
+            for row in rows:
+                try:
+                    # Get the link element for name and ID
+                    link = row.locator("td.hauptlink a").first
+                    if await link.count() == 0: continue
+                    
+                    href = await link.get_attribute("href")
+                    tm_id = href.split('/')[-1]
+                    name = await link.inner_text()
+                    
+                    # Target the specific columns for Position and Value
+                    # Industry Tip: TM squad tables usually have fixed column orders
+                    position = await row.locator("td:nth-child(2) tr:nth-child(2) td").inner_text()
+                    value = await row.locator("td.rechts.hauptlink").inner_text()
+                    club_name = await page.locator("h1.data-header__headline-wrapper").inner_text()
 
-        await browser.close()
-        return {"error": "No players found."}
+                    all_players.append({
+                        "tm_id": tm_id,
+                        "name": name.strip(),
+                        "slug": href.split('/')[1],
+                        "position": position.strip(),
+                        "current_market_value": value.strip(),
+                        "club": club_name.strip()
+                    })
+                except:
+                    continue
+
+        # 3. Bulk UPSERT to Supabase
+        if all_players:
+            supabase.table("players").upsert(all_players).execute()
+            return {"status": "success", "total": len(all_players)}
 
 # --- SEARCH: Quick Lookup ---
 @app.get("/search")
