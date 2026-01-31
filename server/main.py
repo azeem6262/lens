@@ -255,52 +255,75 @@ async def segregate_players():
     except Exception as e:
         return {"error": str(e)}
 
-@app.get("/scrape/fbref/detailed/{fbref_id}")
-async def get_detailed_stats(fbref_id: str):
+@app.get("/scrape/fbref/attackers")
+async def scrape_fbref_attackers():
+    # 1. Fetch attackers who don't have an fbref_id yet
+    response = supabase.table("players") \
+        .select("tm_id, name, club") \
+        .eq("position_group", "Attacker") \
+        .is_("fbref_id", "null") \
+        .execute()
+    attackers = response.data
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        # Use a real User-Agent to prevent bot detection
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        # Professional context to handle FBRef's structure
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
-        
-        # Nico Williams example: afdc14d7
-        url = f"https://fbref.com/en/players/{fbref_id}/all_comps/stats"
-        
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            
-            # Helper function to find a stat by row name
-            async def get_stat(label):
-                # Target the 'Per 90' column in the scouting report summary table
-                locator = page.locator(f"tr:has-text('{label}') td").first
-                if await locator.count() > 0:
-                    val = await locator.inner_text()
-                    return float(val) if val != '-' else 0.0
-                return 0.0
 
-            # Extraction mapping
-            detailed_stats = {
-                "goals_per_90": await get_stat("Goals"),
-                "npxg_per_90": await get_stat("npxG"), # Non-penalty xG
-                "shots_total_per_90": await get_stat("Shots Total"),
-                "conversion_rate": await get_stat("Goals/Shot"),
-                "sca_per_90": await get_stat("Shot-Creating Actions"),
-                "progressive_carries": await get_stat("Progressive Carries") # Key for wingers
-            }
+        for player in attackers[:10]:
+            try:
+                # Step A: Find FBRef Profile
+                query = f"{player['name']} {player['club']} fbref scouting report"
+                search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+                
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+                link_element = page.locator("a[href*='fbref.com/en/players/']").first
+                full_url = await link_element.get_attribute("href")
+                
+                # Step B: Visit the Scouting Report
+                fb_id = full_url.split('/')[5]
+                scouting_url = f"https://fbref.com/en/players/{fb_id}/scouting/365/Standard-Stats-Scouting-Report"
+                await page.goto(scouting_url, wait_until="domcontentloaded", timeout=30000)
+                
+                # Step C: Extraction Logic using 'tr:has-text'
+                async def get_val(label):
+                    # We target the first 'td' which is the 'Per 90' value in the summary table
+                    loc = page.locator(f"tr:has-text('{label}') td").first
+                    if await loc.count() > 0:
+                        text = await loc.inner_text()
+                        return text.strip()
+                    return "0.0"
 
-            # Update your stats_attackers table
-            # Assuming you passed tm_id earlier or linked it in your DB
-            # supabase.table("stats_attackers").update(detailed_stats).eq("tm_id", ...).execute()
+                raw_stats = {
+                    "goals_per_90": await get_val("Goals"),
+                    "npxg_per_90": await get_val("npxG"),
+                    "shots_total_per_90": await get_val("Shots Total"),
+                    "conversion_rate": await get_val("Goals/Shot"),
+                    "sca_per_90": await get_val("Shot-Creating Actions"),
+                    "progressive_carries_per_90": await get_val("Progressive Carries")
+                }
 
-            await browser.close()
-            return detailed_stats
-            
-        except Exception as e:
-            await browser.close()
-            return {"error": str(e)}
+                # Step D: Data Cleaning
+                clean_stats = {}
+                for k, v in raw_stats.items():
+                    clean_stats[k] = float(v) if v and v != '-' else 0.0
 
+                # Step E: Sync to Database
+                # Update Master ID
+                supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
+                
+                # Update Performance Table
+                supabase.table("stats_attackers").update(clean_stats).eq("tm_id", player['tm_id']).execute()
+
+            except Exception as e:
+                print(f"Error on {player['name']}: {str(e)}")
+                continue
+
+        await browser.close()
+        return {"status": "Complete: Found IDs and Scraped Deep Stats"}
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
