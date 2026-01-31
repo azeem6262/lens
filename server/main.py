@@ -47,44 +47,54 @@ async def health_check():
 async def ingest_league(league_url: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = await browser.new_page()
-        
-        # Use a high timeout and wait for the specific table to load
-        await page.goto(league_url, wait_until="networkidle", timeout=60000)
-        
-        # 1. Target only the player links inside the 'items' or 'responsive-table' div
-        # This prevents grabbing links from news articles or headers
-        player_selector = "div.responsive-table td.hauptlink a"
-        await page.wait_for_selector(player_selector)
-        
-        player_links = await page.locator(player_selector).all()
-        players = []
-        
-        # 2. Use a Set to prevent duplicates in the same scrape
-        seen_ids = set()
-        
-        for link in player_links:
+        context = await browser.new_context(user_agent="Mozilla/5.0...")
+        page = await context.new_page()
+
+        # STEP 1: Get all Club URLs from the League Table
+        await page.goto(league_url, wait_until="domcontentloaded")
+        club_links = await page.locator("td.hauptlink a").all()
+        club_urls = []
+        for link in club_links:
             href = await link.get_attribute("href")
-            if href and "profil" in href:
-                parts = href.split('/')
-                tm_id = parts[4]
+            if href and "startseite/verein" in href:
+                # Construct absolute URL
+                club_urls.append(f"https://www.transfermarkt.com{href}")
+        
+        # Remove duplicates
+        club_urls = list(set(club_urls))
+        all_players = []
+
+        # STEP 2: Visit each club and grab its players
+        for club_url in club_urls:
+            try:
+                await page.goto(club_url, wait_until="domcontentloaded", timeout=15000)
+                # Select only the player profile links in the squad table
+                player_links = await page.locator("div.responsive-table td.hauptlink a").all()
                 
-                if tm_id not in seen_ids:
-                    players.append({
-                        "tm_id": tm_id,
-                        "name": (await link.inner_text()).strip(),
-                        "slug": parts[1]
-                    })
-                    seen_ids.add(tm_id)
-        
-        if players:
-            # Send to Supabase
-            supabase.table("players").upsert(players).execute()
+                for link in player_links:
+                    href = await link.get_attribute("href")
+                    if href and "profil/spieler" in href:
+                        parts = href.split('/')
+                        all_players.append({
+                            "tm_id": parts[4],
+                            "name": (await link.inner_text()).strip(),
+                            "slug": parts[1]
+                        })
+            except Exception:
+                continue # Skip a club if it fails, don't crash the whole ingest
+
+        # STEP 3: Save to Supabase
+        if all_players:
+            # Use chunks of 100 to avoid Supabase timeout on massive lists
+            for i in range(0, len(all_players), 100):
+                chunk = all_players[i:i + 100]
+                supabase.table("players").upsert(chunk).execute()
+            
             await browser.close()
-            return {"ingested_count": len(players)}
-        
+            return {"status": "success", "total_ingested": len(all_players)}
+
         await browser.close()
-        return {"error": "No players found in the squad table"}
+        return {"error": "No players found."}
 
 # --- SEARCH: Quick Lookup ---
 @app.get("/search")
