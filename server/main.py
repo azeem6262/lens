@@ -255,6 +255,52 @@ async def segregate_players():
     except Exception as e:
         return {"error": str(e)}
 
+@app.get("/scrape/fbref/detailed/{fbref_id}")
+async def get_detailed_stats(fbref_id: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        # Use a real User-Agent to prevent bot detection
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+        
+        # Nico Williams example: afdc14d7
+        url = f"https://fbref.com/en/players/{fbref_id}/all_comps/stats"
+        
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            
+            # Helper function to find a stat by row name
+            async def get_stat(label):
+                # Target the 'Per 90' column in the scouting report summary table
+                locator = page.locator(f"tr:has-text('{label}') td").first
+                if await locator.count() > 0:
+                    val = await locator.inner_text()
+                    return float(val) if val != '-' else 0.0
+                return 0.0
+
+            # Extraction mapping
+            detailed_stats = {
+                "goals_per_90": await get_stat("Goals"),
+                "npxg_per_90": await get_stat("npxG"), # Non-penalty xG
+                "shots_total_per_90": await get_stat("Shots Total"),
+                "conversion_rate": await get_stat("Goals/Shot"),
+                "sca_per_90": await get_stat("Shot-Creating Actions"),
+                "progressive_carries": await get_stat("Progressive Carries") # Key for wingers
+            }
+
+            # Update your stats_attackers table
+            # Assuming you passed tm_id earlier or linked it in your DB
+            # supabase.table("stats_attackers").update(detailed_stats).eq("tm_id", ...).execute()
+
+            await browser.close()
+            return detailed_stats
+            
+        except Exception as e:
+            await browser.close()
+            return {"error": str(e)}
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
