@@ -47,52 +47,78 @@ async def health_check():
 async def ingest_league(league_url: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = await browser.new_page()
-        await page.goto(league_url, wait_until="domcontentloaded")
+        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        page = await context.new_page()
         
-        # 1. Get all Club URLs first (as we did before)
-        club_links = await page.locator("td.hauptlink a").all()
-        club_urls = [f"https://www.transfermarkt.com{await l.get_attribute('href')}" for l in club_links if "verein" in await l.get_attribute('href')]
-        club_urls = list(set(club_urls))
-        
-        all_players = []
-
-        for club_url in club_urls:
-            await page.goto(club_url, wait_until="domcontentloaded")
-            # 2. Target the actual table rows in the squad table
-            rows = await page.locator("table.items > tbody > tr").all()
+        try:
+            # 1. Get Club URLs from League Page
+            await page.goto(league_url, wait_until="domcontentloaded", timeout=60000)
+            club_links = await page.locator("td.hauptlink a").all()
+            club_urls = []
+            for link in club_links:
+                href = await link.get_attribute("href")
+                if href and "startseite/verein" in href:
+                    club_urls.append(f"https://www.transfermarkt.com{href}")
             
-            for row in rows:
+            club_urls = list(set(club_urls))
+            all_players = []
+
+            # 2. Visit each club
+            for club_url in club_urls:
                 try:
-                    # Get the link element for name and ID
-                    link = row.locator("td.hauptlink a").first
-                    if await link.count() == 0: continue
-                    
-                    href = await link.get_attribute("href")
-                    tm_id = href.split('/')[-1]
-                    name = await link.inner_text()
-                    
-                    # Target the specific columns for Position and Value
-                    # Industry Tip: TM squad tables usually have fixed column orders
-                    position = await row.locator("td:nth-child(2) tr:nth-child(2) td").inner_text()
-                    value = await row.locator("td.rechts.hauptlink").inner_text()
+                    await page.goto(club_url, wait_until="domcontentloaded", timeout=30000)
                     club_name = await page.locator("h1.data-header__headline-wrapper").inner_text()
+                    rows = await page.locator("table.items > tbody > tr").all()
+                    
+                    for row in rows:
+                        try:
+                            # Verify this is a player row
+                            link = row.locator("td.hauptlink a").first
+                            if await link.count() == 0: continue
+                            
+                            href = await link.get_attribute("href")
+                            if "profil/spieler" not in href: continue
+                            
+                            # Extract data with safe fallbacks to prevent 500 errors
+                            tm_id = href.split('/')[-1]
+                            name = await link.inner_text()
+                            
+                            # Position is usually in the second row of the first cell's table
+                            pos_locator = row.locator("td.hauptlink + td") # fallback
+                            position = await row.locator("table.inline-table tr:nth-child(2) td").inner_text() if await row.locator("table.inline-table").count() > 0 else "Unknown"
+                            
+                            # Market Value is in the cell with class 'rechts hauptlink'
+                            value_cell = row.locator("td.rechts.hauptlink")
+                            value = await value_cell.inner_text() if await value_cell.count() > 0 else "N/A"
 
-                    all_players.append({
-                        "tm_id": tm_id,
-                        "name": name.strip(),
-                        "slug": href.split('/')[1],
-                        "position": position.strip(),
-                        "current_market_value": value.strip(),
-                        "club": club_name.strip()
-                    })
-                except:
-                    continue
+                            all_players.append({
+                                "tm_id": tm_id,
+                                "name": name.strip(),
+                                "slug": href.split('/')[1],
+                                "position": position.strip(),
+                                "current_market_value": value.strip(),
+                                "club": club_name.strip()
+                            })
+                        except Exception:
+                            continue # Skip bad player rows
+                except Exception:
+                    continue # Skip bad club pages
 
-        # 3. Bulk UPSERT to Supabase
-        if all_players:
-            supabase.table("players").upsert(all_players).execute()
-            return {"status": "success", "total": len(all_players)}
+            # 3. Bulk UPSERT in chunks
+            if all_players:
+                for i in range(0, len(all_players), 100):
+                    chunk = all_players[i:i + 100]
+                    supabase.table("players").upsert(chunk).execute()
+                
+                await browser.close()
+                return {"status": "success", "total_ingested": len(all_players)}
+
+            await browser.close()
+            return {"error": "No players found"}
+
+        except Exception as e:
+            await browser.close()
+            return {"error": f"Critical Failure: {str(e)}"}
 
 # --- SEARCH: Quick Lookup ---
 @app.get("/search")
