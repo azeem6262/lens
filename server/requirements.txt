@@ -6,3 +6,5 @@ beautifulsoup4
 pandas
 xgboost
 scikit-learn
+supabase
+python-dotenv

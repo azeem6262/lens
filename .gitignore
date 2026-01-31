@@ -1,0 +1,19 @@
+# Environments
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+
+# Node (for your 'client' folder)
+node_modules/
+dist/
+.next/
+
+# OS specific
+.DS_Store
+Thumbs.db
