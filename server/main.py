@@ -48,28 +48,43 @@ async def ingest_league(league_url: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         page = await browser.new_page()
-        await page.goto(league_url, wait_until="domcontentloaded")
         
-        player_links = await page.locator("td.hauptlink a").all()
+        # Use a high timeout and wait for the specific table to load
+        await page.goto(league_url, wait_until="networkidle", timeout=60000)
+        
+        # 1. Target only the player links inside the 'items' or 'responsive-table' div
+        # This prevents grabbing links from news articles or headers
+        player_selector = "div.responsive-table td.hauptlink a"
+        await page.wait_for_selector(player_selector)
+        
+        player_links = await page.locator(player_selector).all()
         players = []
+        
+        # 2. Use a Set to prevent duplicates in the same scrape
+        seen_ids = set()
         
         for link in player_links:
             href = await link.get_attribute("href")
             if href and "profil" in href:
                 parts = href.split('/')
-                players.append({
-                    "tm_id": parts[4],
-                    "name": (await link.inner_text()).strip(),
-                    "slug": parts[1]
-                })
+                tm_id = parts[4]
+                
+                if tm_id not in seen_ids:
+                    players.append({
+                        "tm_id": tm_id,
+                        "name": (await link.inner_text()).strip(),
+                        "slug": parts[1]
+                    })
+                    seen_ids.add(tm_id)
         
         if players:
+            # Send to Supabase
             supabase.table("players").upsert(players).execute()
             await browser.close()
             return {"ingested_count": len(players)}
         
         await browser.close()
-        return {"error": "No players found"}
+        return {"error": "No players found in the squad table"}
 
 # --- SEARCH: Quick Lookup ---
 @app.get("/search")
