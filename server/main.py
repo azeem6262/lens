@@ -257,64 +257,54 @@ async def segregate_players():
 
 @app.get("/scrape/fbref/attackers")
 async def scrape_fbref_attackers():
-    # 1. Fetch attackers from Supabase
+    # 1. Fetch attackers who still need an ID
     response = supabase.table("players").select("tm_id, name, club").eq("position_group", "Attacker").is_("fbref_id", "null").execute()
     attackers = response.data
-    
+
     if not attackers:
-        return {"status": "No players found needing an FBRef ID."}
+        return {"message": "All attackers already have IDs. Ready for deep scraping!"}
 
     async with async_playwright() as p:
-        # We add 'slow_mo' to look more human and avoid Google bans
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
+        context = await browser.new_context(user_agent="Mozilla/5.0...")
         page = await context.new_page()
 
         processed = []
-        for player in attackers[:3]: # Keep batch small for debugging
-            print(f"--- Processing: {player['name']} ---")
+        for player in attackers[:5]:
             try:
-                # Add 'fbref' and the club to narrow the search
-                search_query = f"fbref {player['name']} {player['club']} scouting report"
-                search_url = f"https://www.google.com/search?q={search_query.replace(' ', '+')}"
-                
+                # BYPASS GOOGLE: Go directly to FBRef's internal search
+                search_url = f"https://fbref.com/en/search/search.fcgi?search={player['name'].replace(' ', '+')}"
                 await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+
+                # If FBRef finds an exact match, it redirects to the player page
+                # If not, it shows a list. We grab the first player link.
+                current_url = page.url
                 
-                # DEBUG: Print the title of the page Google served us
-                page_title = await page.title()
-                print(f"Google Search Page Title: {page_title}")
-
-                # If the title contains "Carousel" or "Top 25", we hit a snippet. 
-                # We target only organic links inside 'div#search'
-                fbref_link_locator = page.locator("#search a[href*='fbref.com/en/players/']").first
-                
-                if await fbref_link_locator.count() > 0:
-                    profile_url = await fbref_link_locator.get_attribute("href")
-                    print(f"Found FBRef URL: {profile_url}")
-                    
-                    fb_id = profile_url.split('/')[5]
-                    print(f"Extracted FBRef ID: {fb_id}")
-
-                    # --- UPDATE SUPABASE ---
-                    update_res = supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
-                    
-                    if update_res.data:
-                        print(f"Successfully updated Supabase for {player['name']}")
-                        processed.append(player['name'])
-                    else:
-                        print(f"FAILED to update Supabase. Check RLS policies!")
-
+                if "/players/" in current_url:
+                    # Case 1: Direct Redirect
+                    fb_id = current_url.split('/')[5]
                 else:
-                    print(f"Could not find an organic FBRef link for {player['name']} on the first page.")
+                    # Case 2: Search Results List
+                    first_link = page.locator("#search_results .search-item a").first
+                    if await first_link.count() > 0:
+                        href = await first_link.get_attribute("href")
+                        fb_id = href.split('/')[3] # Format is /en/players/ID/Name
+                    else:
+                        continue
+
+                # 2. Update Supabase IMMEDIATELY
+                supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
+                processed.append({"name": player['name'], "fb_id": fb_id})
+                
+                # Small wait to avoid being rate-limited
+                await page.wait_for_timeout(2000)
 
             except Exception as e:
-                print(f"CRITICAL ERROR for {player['name']}: {str(e)}")
+                print(f"Error on {player['name']}: {e}")
                 continue
 
         await browser.close()
-        return {"processed": processed, "message": "Check Render Logs for full details"}
+        return {"status": "success", "new_ids_found": processed}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
