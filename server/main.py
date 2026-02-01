@@ -257,59 +257,64 @@ async def segregate_players():
 
 @app.get("/scrape/fbref/attackers")
 async def scrape_fbref_attackers():
-    # 1. Fetch attackers who still need an ID
+    # 1. Fetch attackers from Supabase
     response = supabase.table("players").select("tm_id, name, club").eq("position_group", "Attacker").is_("fbref_id", "null").execute()
     attackers = response.data
+    
+    if not attackers:
+        return {"status": "No players found needing an FBRef ID."}
 
     async with async_playwright() as p:
+        # We add 'slow_mo' to look more human and avoid Google bans
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
         page = await context.new_page()
 
-        for player in attackers[:3]: # Testing very small batch first
+        processed = []
+        for player in attackers[:3]: # Keep batch small for debugging
+            print(f"--- Processing: {player['name']} ---")
             try:
-                # FORCE FBRef: site:fbref.com prevents Transfermarkt from appearing
-                query = f"site:fbref.com {player['name']} {player['club']} scouting report"
-                search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+                # Add 'fbref' and the club to narrow the search
+                search_query = f"fbref {player['name']} {player['club']} scouting report"
+                search_url = f"https://www.google.com/search?q={search_query.replace(' ', '+')}"
                 
-                await page.goto(search_url, wait_until="networkidle", timeout=30000)
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
                 
-                # ORGANIC ONLY: We target the #search results, ignoring the 'Featured Snippets' top box
-                fbref_link = page.locator("#search a[href*='fbref.com/en/players/']").first
+                # DEBUG: Print the title of the page Google served us
+                page_title = await page.title()
+                print(f"Google Search Page Title: {page_title}")
+
+                # If the title contains "Carousel" or "Top 25", we hit a snippet. 
+                # We target only organic links inside 'div#search'
+                fbref_link_locator = page.locator("#search a[href*='fbref.com/en/players/']").first
                 
-                if await fbref_link.count() > 0:
-                    profile_url = await fbref_link.get_attribute("href")
+                if await fbref_link_locator.count() > 0:
+                    profile_url = await fbref_link_locator.get_attribute("href")
+                    print(f"Found FBRef URL: {profile_url}")
+                    
                     fb_id = profile_url.split('/')[5]
-                    
-                    # Direct jump to the deep scouting stats
-                    scouting_url = f"https://fbref.com/en/players/{fb_id}/scouting/365/Standard-Stats-Scouting-Report"
-                    await page.goto(scouting_url, wait_until="domcontentloaded", timeout=30000)
-                    
-                    # Helper for extracting 'Per 90' data
-                    async def get_val(label):
-                        loc = page.locator(f"tr:has-text('{label}') td").first
-                        return (await loc.inner_text()).strip() if await loc.count() > 0 else "0.0"
+                    print(f"Extracted FBRef ID: {fb_id}")
 
-                    stats = {
-                        "goals_per_90": await get_val("Goals"),
-                        "npxg_per_90": await get_val("npxG"),
-                        "shots_total_per_90": await get_val("Shots Total"),
-                        "conversion_rate": await get_val("Goals/Shot"),
-                        "sca_per_90": await get_val("Shot-Creating Actions"),
-                        "progressive_carries_per_90": await get_val("Progressive Carries")
-                    }
+                    # --- UPDATE SUPABASE ---
+                    update_res = supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
+                    
+                    if update_res.data:
+                        print(f"Successfully updated Supabase for {player['name']}")
+                        processed.append(player['name'])
+                    else:
+                        print(f"FAILED to update Supabase. Check RLS policies!")
 
-                    # Clean & Save
-                    clean = {k: float(v) if v and v != '-' else 0.0 for k, v in stats.items()}
-                    supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
-                    supabase.table("stats_attackers").update(clean).eq("tm_id", player['tm_id']).execute()
-                
-                await page.wait_for_timeout(3000) # Wait to avoid search bans
-            except Exception:
+                else:
+                    print(f"Could not find an organic FBRef link for {player['name']} on the first page.")
+
+            except Exception as e:
+                print(f"CRITICAL ERROR for {player['name']}: {str(e)}")
                 continue
 
         await browser.close()
-        return {"status": "Batch complete", "message": "Verify results in Supabase"}
+        return {"processed": processed, "message": "Check Render Logs for full details"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
