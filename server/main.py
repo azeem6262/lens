@@ -311,50 +311,55 @@ async def scrape_fbref_attackers():
 
 @app.post("/process/instant-mapping")
 async def instant_mapping():
-    try:
-        # 1. Use the most stable 2026 player mapping source
-        # This source is maintained by the worldfootballR community
-        map_url = "https://raw.githubusercontent.com/tonyelhabr/sports-data/master/data-raw/player_mapping.csv"
-        
-        # Adding a timeout and user-agent to avoid being blocked by GitHub
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(map_url, headers=headers, timeout=10)
-        
-        if r.status_code != 200:
-            return {"error": f"Failed to fetch mapping file. HTTP {r.status_code}"}
+    # 1. Fetch attackers who need an ID
+    response = supabase.table("players") \
+        .select("tm_id, name, club") \
+        .eq("position_group", "Attacker") \
+        .is_("fbref_id", "null") \
+        .execute()
+    attackers = response.data
 
-        df = pd.read_csv(io.StringIO(r.text))
-        
-        # 2. Get your players from Supabase
-        response = supabase.table("players").select("tm_id").execute()
-        my_players = response.data
-        
-        count = 0
-        updates = []
+    if not attackers:
+        return {"message": "All attackers already have IDs."}
 
-        # 3. Match and Update
-        for p in my_players:
-            my_tm_id = str(p['tm_id'])
-            
-            # The column names in this new source are usually 'tm_id' and 'fbref_id'
-            match = df[df['transfermarkt_id'].astype(str) == my_tm_id]
-            
-            if not match.empty:
-                fb_id = match.iloc[0]['fbref_id']
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = await browser.new_context(user_agent="Mozilla/5.0...")
+        page = await context.new_page()
+
+        mapped_count = 0
+        for player in attackers[:10]: # Batch of 10 for testing
+            try:
+                # 2. Use FBRef's internal search - extremely stable
+                search_url = f"https://fbref.com/en/search/search.fcgi?search={player['name'].replace(' ', '+')}"
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+
+                # Case A: FBRef redirects directly to the player page
+                current_url = page.url
+                if "/players/" in current_url:
+                    fb_id = current_url.split('/')[5]
+                else:
+                    # Case B: Multiple results found, pick the first one
+                    first_result = page.locator("#search_results .search-item a").first
+                    if await first_result.count() > 0:
+                        href = await first_result.get_attribute("href")
+                        fb_id = href.split('/')[3] # Format: /en/players/ID/Name
+                    else:
+                        continue
+
+                # 3. Save the ID
+                supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
+                mapped_count += 1
                 
-                # Push update
-                supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", my_tm_id).execute()
-                count += 1
-                
-        return {
-            "status": "success", 
-            "mapped_count": count, 
-            "total_players_in_db": len(my_players),
-            "source": "worldfootballR community"
-        }
-        
-    except Exception as e:
-        return {"error": f"Mapping failed: {str(e)}"}
+                # Small delay to prevent rate limits
+                await page.wait_for_timeout(1500)
+
+            except Exception as e:
+                print(f"Skipping {player['name']}: {e}")
+                continue
+
+        await browser.close()
+        return {"status": "success", "new_mappings": mapped_count}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
