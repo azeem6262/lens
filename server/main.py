@@ -312,38 +312,46 @@ async def scrape_fbref_attackers():
 @app.post("/process/instant-mapping")
 async def instant_mapping():
     try:
-        # 1. Load the mapping file
-        map_url = "https://raw.githubusercontent.com/jokullsolberg/transfermarkt-fbref-id-mapper/main/mapping.csv"
-        df = pd.read_csv(map_url)
+        # 1. Use the most stable 2026 player mapping source
+        # This source is maintained by the worldfootballR community
+        map_url = "https://raw.githubusercontent.com/tonyelhabr/sports-data/master/data-raw/player_mapping.csv"
         
-        # 2. Extract tm_id from the URL column in the CSV
-        # The CSV has 'url_transfermarkt' like: /spieler-name/profil/spieler/12345
-        if 'url_transfermarkt' in df.columns:
-            df['tm_id_from_url'] = df['url_transfermarkt'].str.split('/').str[-1]
-            # Ensure fbref_id is also extracted from the FBref URL
-            df['fb_id_from_url'] = df['url_fbref'].str.split('/').str[5]
-        else:
-            return {"error": f"CSV columns mismatch. Found: {df.columns.tolist()}"}
+        # Adding a timeout and user-agent to avoid being blocked by GitHub
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(map_url, headers=headers, timeout=10)
         
-        # 3. Get your players from Supabase
+        if r.status_code != 200:
+            return {"error": f"Failed to fetch mapping file. HTTP {r.status_code}"}
+
+        df = pd.read_csv(io.StringIO(r.text))
+        
+        # 2. Get your players from Supabase
         response = supabase.table("players").select("tm_id").execute()
         my_players = response.data
         
         count = 0
+        updates = []
+
+        # 3. Match and Update
         for p in my_players:
             my_tm_id = str(p['tm_id'])
             
-            # Match your ID against the ID we extracted from the CSV URL
-            match = df[df['tm_id_from_url'] == my_tm_id]
+            # The column names in this new source are usually 'tm_id' and 'fbref_id'
+            match = df[df['transfermarkt_id'].astype(str) == my_tm_id]
             
             if not match.empty:
-                fb_id = match.iloc[0]['fb_id_from_url']
+                fb_id = match.iloc[0]['fbref_id']
                 
-                # Update Supabase
+                # Push update
                 supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", my_tm_id).execute()
                 count += 1
                 
-        return {"status": "success", "mapped_count": count, "total_checked": len(my_players)}
+        return {
+            "status": "success", 
+            "mapped_count": count, 
+            "total_players_in_db": len(my_players),
+            "source": "worldfootballR community"
+        }
         
     except Exception as e:
         return {"error": f"Mapping failed: {str(e)}"}
