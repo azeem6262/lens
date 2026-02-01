@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 import uvicorn
 from supabase import create_client, Client
 import re
+import pandas as pd
+import io
+import requests
 
 # 1. Load Environment
 load_dotenv() 
@@ -305,6 +308,28 @@ async def scrape_fbref_attackers():
 
         await browser.close()
         return {"status": "success", "new_ids_found": processed}
+
+@app.post("/process/instant-mapping")
+async def instant_mapping():
+    # 1. Load the reliable community mapping CSV
+    map_url = "https://raw.githubusercontent.com/jokullsolberg/transfermarkt-fbref-id-mapper/main/mapping.csv"
+    response = requests.get(map_url)
+    df = pd.read_csv(io.StringIO(response.text))
+    
+    # 2. Get your players from Supabase
+    my_players = supabase.table("players").select("tm_id, name").execute().data
+    
+    count = 0
+    for p in my_players:
+        # Match by Transfermarkt ID (ensuring both are strings)
+        match = df[df['tm_id'].astype(str) == str(p['tm_id'])]
+        
+        if not match.empty:
+            fb_id = match.iloc[0]['fbref_id']
+            supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", p['tm_id']).execute()
+            count += 1
+            
+    return {"status": "Mapping complete", "total_mapped": count}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))

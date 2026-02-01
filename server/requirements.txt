@@ -4,6 +4,7 @@ uvicorn
 cloudscraper
 beautifulsoup4
 pandas
+requests
 xgboost
 scikit-learn
 supabase
