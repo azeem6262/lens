@@ -311,55 +311,62 @@ async def scrape_fbref_attackers():
 
 @app.post("/process/instant-mapping")
 async def instant_mapping():
-    # 1. Fetch attackers who need an ID
+    # 1. Target ANY player without an ID (Attackers, Midfielders, etc.)
     response = supabase.table("players") \
         .select("tm_id, name, club") \
-        .eq("position_group", "Attacker") \
-        .is_("fbref_id", "null") \
+        .or_("fbref_id.is.null, fbref_id.eq.") \
         .execute()
-    attackers = response.data
+    
+    players_to_map = response.data
 
-    if not attackers:
-        return {"message": "All attackers already have IDs."}
+    if not players_to_map:
+        return {"status": "success", "new_mappings": 0, "message": "All players already have IDs."}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(user_agent="Mozilla/5.0...")
+        # Professional user-agent to ensure we get the desktop search results
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         page = await context.new_page()
 
         mapped_count = 0
-        for player in attackers[:10]: # Batch of 10 for testing
+        for player in players_to_map[:10]: # Batch of 10 for safety
             try:
-                # 2. Use FBRef's internal search - extremely stable
+                # 2. Search FBRef directly using their internal search engine
                 search_url = f"https://fbref.com/en/search/search.fcgi?search={player['name'].replace(' ', '+')}"
                 await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
 
-                # Case A: FBRef redirects directly to the player page
+                # Check if we were redirected straight to a profile or a search list
                 current_url = page.url
+                
                 if "/players/" in current_url:
+                    # Case A: Direct hit (FBRef was sure)
                     fb_id = current_url.split('/')[5]
                 else:
-                    # Case B: Multiple results found, pick the first one
-                    first_result = page.locator("#search_results .search-item a").first
-                    if await first_result.count() > 0:
-                        href = await first_result.get_attribute("href")
-                        fb_id = href.split('/')[3] # Format: /en/players/ID/Name
+                    # Case B: Multiple results (Pick the first one)
+                    # We target the first link in the search results table
+                    first_link = page.locator("#search_results .search-item a").first
+                    if await first_link.count() > 0:
+                        href = await first_link.get_attribute("href")
+                        # Format is /en/players/ID/Name
+                        fb_id = href.split('/')[3]
                     else:
                         continue
 
-                # 3. Save the ID
+                # 3. Update Supabase
                 supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", player['tm_id']).execute()
                 mapped_count += 1
                 
-                # Small delay to prevent rate limits
-                await page.wait_for_timeout(1500)
+                # Human-like delay to avoid rate limiting
+                await page.wait_for_timeout(2000)
 
             except Exception as e:
-                print(f"Skipping {player['name']}: {e}")
+                print(f"Error mapping {player['name']}: {e}")
                 continue
 
         await browser.close()
-        return {"status": "success", "new_mappings": mapped_count}
+        return {"status": "Batch complete", "new_mappings": mapped_count}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
