@@ -311,25 +311,42 @@ async def scrape_fbref_attackers():
 
 @app.post("/process/instant-mapping")
 async def instant_mapping():
-    # 1. Load the reliable community mapping CSV
-    map_url = "https://raw.githubusercontent.com/jokullsolberg/transfermarkt-fbref-id-mapper/main/mapping.csv"
-    response = requests.get(map_url)
-    df = pd.read_csv(io.StringIO(response.text))
-    
-    # 2. Get your players from Supabase
-    my_players = supabase.table("players").select("tm_id, name").execute().data
-    
-    count = 0
-    for p in my_players:
-        # Match by Transfermarkt ID (ensuring both are strings)
-        match = df[df['tm_id'].astype(str) == str(p['tm_id'])]
+    try:
+        # 1. Load the mapping file
+        map_url = "https://raw.githubusercontent.com/jokullsolberg/transfermarkt-fbref-id-mapper/main/mapping.csv"
+        df = pd.read_csv(map_url)
         
-        if not match.empty:
-            fb_id = match.iloc[0]['fbref_id']
-            supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", p['tm_id']).execute()
-            count += 1
+        # 2. Extract tm_id from the URL column in the CSV
+        # The CSV has 'url_transfermarkt' like: /spieler-name/profil/spieler/12345
+        if 'url_transfermarkt' in df.columns:
+            df['tm_id_from_url'] = df['url_transfermarkt'].str.split('/').str[-1]
+            # Ensure fbref_id is also extracted from the FBref URL
+            df['fb_id_from_url'] = df['url_fbref'].str.split('/').str[5]
+        else:
+            return {"error": f"CSV columns mismatch. Found: {df.columns.tolist()}"}
+        
+        # 3. Get your players from Supabase
+        response = supabase.table("players").select("tm_id").execute()
+        my_players = response.data
+        
+        count = 0
+        for p in my_players:
+            my_tm_id = str(p['tm_id'])
             
-    return {"status": "Mapping complete", "total_mapped": count}
+            # Match your ID against the ID we extracted from the CSV URL
+            match = df[df['tm_id_from_url'] == my_tm_id]
+            
+            if not match.empty:
+                fb_id = match.iloc[0]['fb_id_from_url']
+                
+                # Update Supabase
+                supabase.table("players").update({"fbref_id": fb_id}).eq("tm_id", my_tm_id).execute()
+                count += 1
+                
+        return {"status": "success", "mapped_count": count, "total_checked": len(my_players)}
+        
+    except Exception as e:
+        return {"error": f"Mapping failed: {str(e)}"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
