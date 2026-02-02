@@ -3,9 +3,11 @@ fastapi
 uvicorn
 cloudscraper
 beautifulsoup4
-pandas
 requests
 xgboost
 scikit-learn
 supabase
 python-dotenv
+soccerdata
+pandas
+lxml

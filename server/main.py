@@ -8,6 +8,8 @@ import re
 import pandas as pd
 import io
 import requests
+import soccerdata as sd
+
 
 # 1. Load Environment
 load_dotenv() 
@@ -367,6 +369,60 @@ async def instant_mapping():
 
         await browser.close()
         return {"status": "Batch complete", "new_mappings": mapped_count}
+
+
+@app.post("/process/soccerdata-sync-attackers")
+async def soccerdata_sync_attackers():
+    try:
+        # 1. Initialize FBref (SD handles the 2026 season automatically)
+        fbref = sd.FBref(leagues="ENG-Premier League", seasons="2526")
+        
+        # 2. Pull the 4 vital tables for a complete Attacker profile
+        print("Downloading FBRef tables...")
+        std_df = fbref.read_player_season_stats(stat_type="standard").reset_index()
+        shot_df = fbref.read_player_season_stats(stat_type="shooting").reset_index()
+        pass_df = fbref.read_player_season_stats(stat_type="passing").reset_index()
+        poss_df = fbref.read_player_season_stats(stat_type="possession").reset_index()
+
+        # 3. Get your attackers from Supabase
+        response = supabase.table("players").select("tm_id, name").eq("position_group", "Attacker").execute()
+        my_attackers = response.data
+
+        count = 0
+        for p in my_attackers:
+            # Match by name (Fuzzy matching is handled by checking if name is 'in' FBref name)
+            match = std_df[std_df['player'].str.contains(p['name'], case=False, na=False)]
+            
+            if not match.empty:
+                player_name = match['player'].values[0]
+                
+                # Extracting all fields for your DB
+                # Note: SoccerData uses MultiIndex, so we access via ('Category', 'Stat')
+                stats_payload = {
+                    # From Standard Table
+                    "npxg_per_90": float(match['Expected']['npxG_per90'].values[0]),
+                    
+                    # From Shooting Table (Conversion Rate)
+                    "conversion_rate": float(shot_df[shot_df['player'] == player_name]['Standard']['G/Sh'].values[0] or 0),
+                    
+                    # From Passing Table (Playmaking)
+                    "xa_per_90": float(pass_df[pass_df['player'] == player_name]['Expected']['xA_per90'].values[0] or 0),
+                    
+                    # From Possession Table (Dribbling/Progression)
+                    "progressive_carries_per_90": float(poss_df[poss_df['player'] == player_name]['Carries']['PrgC90'].values[0] or 0),
+                    "successful_take_ons_per_90": float(poss_df[poss_df['player'] == player_name]['Take-Ons']['Succ90'].values[0] or 0),
+                    
+                    "fbref_id": "synced_v1"
+                }
+
+                # 4. Update the stats_attackers table
+                supabase.table("stats_attackers").update(stats_payload).eq("tm_id", p['tm_id']).execute()
+                count += 1
+
+        return {"status": "Complete", "attackers_updated": count}
+        
+    except Exception as e:
+        return {"error": f"Scrape failed: {str(e)}"}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
