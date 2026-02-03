@@ -17,3 +17,7 @@ dist/
 # OS specific
 .DS_Store
 Thumbs.db
+
+data/
+*.parquet
+*.csv
