@@ -232,24 +232,26 @@ def get_position_group(raw_position: str):
 @app.post("/process/segregate")
 async def segregate_players():
     try:
-        # 1. Fetch all players from the master index
         response = supabase.table("players").select("tm_id, position").execute()
         players = response.data
         
         counts = {"Attacker": 0, "Midfielder": 0, "Defender": 0, "Goalkeeper": 0, "Unknown": 0}
 
         for p in players:
-            # Use your existing helper to find the right category and table
             group, table_name = get_position_group(p['position'])
             
             if table_name:
-                # 2. Insert into the specialized table (upsert avoids duplicates)
-                supabase.table(table_name).upsert({
-                    "tm_id": p['tm_id'],
-                    "scraped_at": "now()"
-                }).execute()
+                # THE FIX: Add 'on_conflict' to your upsert call
+                # This tells Postgres: if tm_id exists, don't throw an error!
+                supabase.table(table_name).upsert(
+                    {
+                        "tm_id": p['tm_id'],
+                        "scraped_at": "now()"
+                    },
+                    on_conflict="tm_id" # <--- CRITICAL ADDITION
+                ).execute()
                 
-                # 3. Update the master table so we know the group is assigned
+                # Update the master table
                 supabase.table("players").update({"position_group": group}).eq("tm_id", p['tm_id']).execute()
                 
                 counts[group] += 1
@@ -258,6 +260,7 @@ async def segregate_players():
                 
         return {"message": "Segregation complete", "stats": counts}
     except Exception as e:
+        # This will now only trigger for REAL errors, not duplicates
         return {"error": str(e)}
 
 @app.get("/scrape/fbref/attackers")
@@ -423,6 +426,53 @@ async def soccerdata_sync_attackers():
         
     except Exception as e:
         return {"error": f"Scrape failed: {str(e)}"}
+
+@app.post("/process/master-distribute-upload")
+async def distribute_and_upload():
+    try:
+        # 1. Load the "Universal" stats file you just scraped from Understat
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        stats_path = os.path.join(base_dir, "data", "master_stats_all.parquet")
+        stats_df = pd.read_parquet(stats_path)
+
+        # 2. Fetch the 'Mapping' from Supabase 
+        # We need to know: which tm_id belongs to which position_group?
+        res = supabase.table("players").select("tm_id, position_group").execute()
+        mapping_df = pd.DataFrame(res.data)
+
+        # 3. Merge them locally to "tag" every stat row with its category
+        # This is 100x faster than doing it in the database
+        merged_df = stats_df.merge(mapping_df, on="tm_id", how="inner")
+
+        # 4. Loop through each category and push to the correct table
+        categories = {
+            "Attacker": "stats_attackers",
+            "Midfielder": "stats_midfielders",
+            "Defender": "stats_defenders",
+            "Goalkeeper": "stats_goalkeepers"
+        }
+
+        results = {}
+        for group, table in categories.items():
+            # Filter rows for this specific category
+            to_upload = merged_df[merged_df['position_group'] == group].copy()
+            
+            # Remove the helper column before uploading
+            to_upload = to_upload.drop(columns=['position_group'])
+            
+            if not to_upload.empty:
+                # Use the chunked upload logic here
+                chunk_size = 1000
+                for i in range(0, len(to_upload), chunk_size):
+                    chunk = to_upload.iloc[i : i + chunk_size].to_dict(orient="records")
+                    supabase.table(table).upsert(chunk).execute()
+                
+                results[group] = len(to_upload)
+
+        return {"status": "Distribution Complete", "counts": results}
+
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
