@@ -12,3 +12,8 @@ soccerdata
 pandas
 lxml
 pyarrow
+thefuzz
+mplsoccer
+matplotlib
+seaborn
+numpy
